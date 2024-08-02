@@ -7,7 +7,7 @@ import (
     "log"
     "net/http"
     "time"
-
+    
     "github.com/google/uuid"
     "github.com/gorilla/mux"
     _ "github.com/lib/pq"
@@ -19,15 +19,14 @@ type TransactionService struct {
     db *sql.DB
 }
 
-// type Transaction struct {
-//     ID        string    `json:"id"`
-//     UserID    string    `json:"user_id"`
-//     Amount    float64   `json:"amount"`
-//     Type      string    `json:"type"`
-//     ToUserID  string    `json:"to_user_id,omitempty"`
-//     Timestamp time.Time `json:"timestamp"`
-// }
-
+type Transaction struct {
+    ID        string    `json:"id"`
+    UserID    string    `json:"user_id"`
+    Amount    float64   `json:"amount"`
+    Type      string    `json:"type"`
+    ToUserID  string    `json:"to_user_id,omitempty"`
+    Timestamp time.Time `json:"timestamp"`
+}
 
 func NewTransactionService(nc *nats.Conn, db *sql.DB) *TransactionService {
     return &TransactionService{
@@ -36,12 +35,18 @@ func NewTransactionService(nc *nats.Conn, db *sql.DB) *TransactionService {
     }
 }
 
-func (s *TransactionService) AddMoney(userID string, amount float64) (float64, error) {
+func (s *TransactionService) AddMoney(userEmail string, amount float64) (float64, error) {
     tx, err := s.db.Begin()
     if err != nil {
         return 0, err
     }
     defer tx.Rollback()
+
+    var userID string
+    err = tx.QueryRow("SELECT id FROM users WHERE email = $1", userEmail).Scan(&userID)
+    if err != nil {
+        return 0, fmt.Errorf("user not found: %v", err)
+    }
 
     transactionID := uuid.New().String()
     _, err = tx.Exec(`
@@ -52,31 +57,44 @@ func (s *TransactionService) AddMoney(userID string, amount float64) (float64, e
         return 0, err
     }
 
-    msg, err := s.nc.Request("user.update_balance", []byte(fmt.Sprintf("%s:%f", userID, amount)), 5*time.Second)
+    var newBalance float64
+    err = tx.QueryRow("UPDATE users SET balance = balance + $1 WHERE id = $2 RETURNING balance", amount, userID).Scan(&newBalance)
     if err != nil {
         return 0, err
-    }
-
-    var response struct {
-        Balance float64 `json:"balance"`
-    }
-    if err := json.Unmarshal(msg.Data, &response); err != nil {
-        return 0, fmt.Errorf("failed to unmarshal response: %v", err)
     }
 
     if err := tx.Commit(); err != nil {
         return 0, err
     }
 
-    return response.Balance, nil
+    return newBalance, nil
 }
 
-func (s *TransactionService) TransferMoney(fromUserID, toUserID string, amount float64) error {
+func (s *TransactionService) TransferMoney(fromEmail, toEmail string, amount float64) error {
     tx, err := s.db.Begin()
     if err != nil {
         return err
     }
     defer tx.Rollback()
+
+    var fromUserID, toUserID string
+    err = tx.QueryRow("SELECT id FROM users WHERE email = $1", fromEmail).Scan(&fromUserID)
+    if err != nil {
+        return fmt.Errorf("sender not found: %v", err)
+    }
+    err = tx.QueryRow("SELECT id FROM users WHERE email = $1", toEmail).Scan(&toUserID)
+    if err != nil {
+        return fmt.Errorf("recipient not found: %v", err)
+    }
+
+    var senderBalance float64
+    err = tx.QueryRow("SELECT balance FROM users WHERE id = $1", fromUserID).Scan(&senderBalance)
+    if err != nil {
+        return fmt.Errorf("failed to get sender's balance: %v", err)
+    }
+    if senderBalance < amount {
+        return fmt.Errorf("insufficient balance")
+    }
 
     debitID := uuid.New().String()
     _, err = tx.Exec(`
@@ -96,12 +114,11 @@ func (s *TransactionService) TransferMoney(fromUserID, toUserID string, amount f
         return err
     }
 
-    _, err = s.nc.Request("user.update_balance", []byte(fmt.Sprintf("%s:%f", fromUserID, -amount)), 5*time.Second)
+    _, err = tx.Exec("UPDATE users SET balance = balance - $1 WHERE id = $2", amount, fromUserID)
     if err != nil {
         return err
     }
-
-    _, err = s.nc.Request("user.update_balance", []byte(fmt.Sprintf("%s:%f", toUserID, amount)), 5*time.Second)
+    _, err = tx.Exec("UPDATE users SET balance = balance + $1 WHERE id = $2", amount, toUserID)
     if err != nil {
         return err
     }
@@ -111,15 +128,15 @@ func (s *TransactionService) TransferMoney(fromUserID, toUserID string, amount f
 
 func handleAddMoney(w http.ResponseWriter, r *http.Request, s *TransactionService) {
     var req struct {
-        UserID string  `json:"user_id"`
-        Amount float64 `json:"amount"`
+        UserEmail string  `json:"user_email"`
+        Amount    float64 `json:"amount"`
     }
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
         http.Error(w, err.Error(), http.StatusBadRequest)
         return
     }
 
-    updatedBalance, err := s.AddMoney(req.UserID, req.Amount)
+    updatedBalance, err := s.AddMoney(req.UserEmail, req.Amount)
     if err != nil {
         http.Error(w, fmt.Sprintf("Error adding money: %v", err), http.StatusInternalServerError)
         return
@@ -137,32 +154,31 @@ func handleAddMoney(w http.ResponseWriter, r *http.Request, s *TransactionServic
 
 func handleTransferMoney(w http.ResponseWriter, r *http.Request, s *TransactionService) {
     var req struct {
-        FromUserID string  `json:"from_user_id"`
-        ToUserID   string  `json:"to_user_id"`
-        Amount     float64 `json:"amount_to_transfer"`
+        FromEmail string  `json:"from_email"`
+        ToEmail   string  `json:"to_email"`
+        Amount    float64 `json:"amount"`
     }
     if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
         http.Error(w, err.Error(), http.StatusBadRequest)
         return
     }
 
-    if err := s.TransferMoney(req.FromUserID, req.ToUserID, req.Amount); err != nil {
+    if err := s.TransferMoney(req.FromEmail, req.ToEmail, req.Amount); err != nil {
         http.Error(w, fmt.Sprintf("Error transferring money: %v", err), http.StatusInternalServerError)
         return
     }
 
     w.WriteHeader(http.StatusOK)
+    json.NewEncoder(w).Encode(map[string]string{"status": "success"})
 }
 
 func main() {
-    // Connect to PostgreSQL
     db, err := sql.Open("postgres", "host=localhost dbname=wallet_platform user=mainuser password=mainuserpass sslmode=disable")
     if err != nil {
         log.Fatal(err)
     }
     defer db.Close()
 
-    // Connect to NATS
     nc, err := nats.Connect(nats.DefaultURL)
     if err != nil {
         log.Fatal(err)
