@@ -27,6 +27,7 @@ type UserService struct {
     users map[string]User
 }
 
+// NewUserService creates a new UserService instance
 func NewUserService(db *sql.DB, nc *nats.Conn) *UserService {
 	return &UserService{
 		db:    db,
@@ -35,6 +36,7 @@ func NewUserService(db *sql.DB, nc *nats.Conn) *UserService {
 	}
 }
 
+// CreateUser adds a new user to the database and in-memory map
 func (s *UserService) CreateUser(user User) error {
     _, err := s.db.Exec("INSERT INTO users (id, email, balance) VALUES ($1, $2, $3)", user.ID, user.Email, user.Balance)
     if err != nil {
@@ -51,6 +53,7 @@ func (s *UserService) CreateUser(user User) error {
     return nil
 }
 
+// GetUser retrieves a user from the in-memory map or database
 func (s *UserService) GetUser(email string) (User, error) {
 	s.mutex.RLock()
 	user, exists := s.users[email]
@@ -72,6 +75,7 @@ func (s *UserService) GetUser(email string) (User, error) {
 	return dbUser, nil
 }
 
+// UpdateBalance updates the balance of a user in the database and in-memory map
 func (s *UserService) UpdateBalance(email string, amount float64) error {
     user, err := s.GetUser(email)
     if err != nil {
@@ -91,6 +95,7 @@ func (s *UserService) UpdateBalance(email string, amount float64) error {
     return nil
 }
 
+// HandleBalanceUpdate handles balance update messages from NATS
 func (s *UserService) HandleBalanceUpdate(m *nats.Msg) {
 	parts := strings.Split(string(m.Data), ":")
 	if len(parts) != 2 {
@@ -124,10 +129,12 @@ type UserHandler struct {
     service *UserService
 }
 
+// NewUserHandler creates a new UserHandler instance
 func NewUserHandler(service *UserService) *UserHandler {
 	return &UserHandler{service: service}
 }
 
+// CreateUser handles HTTP requests to create a new user
 func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
     var user User
     if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
@@ -146,7 +153,7 @@ func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
     json.NewEncoder(w).Encode(user)
 }
 
-
+// GetUser handles HTTP requests to retrieve a user
 func (h *UserHandler) GetUser(w http.ResponseWriter, r *http.Request) {
     email := r.URL.Query().Get("email")
     user, err := h.service.GetUser(email)
@@ -157,8 +164,7 @@ func (h *UserHandler) GetUser(w http.ResponseWriter, r *http.Request) {
     json.NewEncoder(w).Encode(user)
 }
 
-
-
+// UpdateBalance handles HTTP requests to update a user's balance
 func (h *UserHandler) UpdateBalance(w http.ResponseWriter, r *http.Request) {
     var req struct {
         Email  string  `json:"email"`
@@ -176,6 +182,7 @@ func (h *UserHandler) UpdateBalance(w http.ResponseWriter, r *http.Request) {
     json.NewEncoder(w).Encode(map[string]float64{"balance": user.Balance})
 }
 
+// GetBalance handles HTTP requests to retrieve a user's balance
 func (h *UserHandler) GetBalance(w http.ResponseWriter, r *http.Request) {
     email := r.URL.Query().Get("email")
     user, err := h.service.GetUser(email)
